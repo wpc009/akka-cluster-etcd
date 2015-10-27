@@ -57,35 +57,54 @@ class LeaderEntryActor(
     etcdClient.compareAndSet(
       key = settings.leaderPath,
       value = address,
-      ttl = Some(settings.leaderEntryTTL.toSeconds.asInstanceOf[Int]),
-      prevExist = Some(false)).recover {
+      ttl = Some(settings.leaderEntryTTL.toSeconds.asInstanceOf[Int])).recover {
         case ex: EtcdException ⇒ ex.error
       }.pipeTo(self)
 
+  when(Init){
+    case Event(Initialize,_) =>
+      createLeaderEntry()
+      goto(AwaitingReply)
+  }
+
   when(Idle) {
-    case Event(StateTimeout, Data(assumeEntryExists)) ⇒
-      if (assumeEntryExists) refreshLeaderEntry()
-      else createLeaderEntry()
+    case Event("refresh", _) ⇒
+      refreshLeaderEntry()
       goto(AwaitingReply)
   }
 
   when(AwaitingReply) {
-    case Event(EtcdResponse(_, _, _), Data(_)) ⇒
-      goto(Idle).using(Data(true)).forMax(refreshInterval)
+    case Event(EtcdResponse(_, _, _), _) ⇒
+      goto(Idle)
     // the entry either expired or was hijacked by another node
-    case Event(EtcdError(EtcdError.TestFailed | EtcdError.KeyNotFound, _, _, _), Data(_)) ⇒
-      goto(Idle).using(Data(false)).forMax(refreshInterval)
+    case Event(EtcdError(EtcdError.TestFailed | EtcdError.KeyNotFound, _, _, _), _) ⇒
+      goto(Idle)
     // recoverable EtcdErrors
-    case Event(err @ EtcdError(_, _, _, _), Data(assumeEntryExists)) ⇒
+    case Event(err @ EtcdError(_, _, _, _),_) ⇒
       log.error(s"etcd error $err")
-      goto(Idle).using(Data(assumeEntryExists)).forMax(settings.etcdRetryDelay)
+      goto(Idle).forMax(settings.etcdRetryDelay)
     // network errors
-    case Event(Status.Failure(t), Data(assumeEntryExists)) ⇒
+    case Event(Status.Failure(t),_) ⇒
       log.error(t, "etcd error")
-      goto(Idle).using(Data(assumeEntryExists)).forMax(settings.etcdRetryDelay)
+      goto(Idle).forMax(settings.etcdRetryDelay)
+
   }
 
-  startWith(Idle, Data(true), Some(refreshInterval))
+  whenUnhandled{
+    case Event(Reset,_) =>
+      goto(Init)
+  }
+
+  onTransition{
+    case Init -> _ =>
+      setTimer("refresh","refresh",refreshInterval,true)
+    case _ -> Init =>
+      cancelTimer("refresh")
+  }
+
+  startWith(Init,null)
+
+
   initialize()
 }
 
@@ -95,8 +114,13 @@ object LeaderEntryActor {
     Props(classOf[LeaderEntryActor], address, etcdClient, settings)
 
   trait State
+  case object Init extends State
   case object Idle extends State
   case object AwaitingReply extends State
 
   case class Data(assumeEntryExists: Boolean)
+
+
+  case object Initialize
+  case object Reset
 }

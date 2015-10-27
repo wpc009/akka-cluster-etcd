@@ -1,7 +1,7 @@
 scalaVersion := "2.11.7"
 
 lazy val commonSettings = Seq(
-    version := "0.1.0",
+//    version := "0.1.0",
     organization := "pl.caltha",
     scalaVersion := "2.11.7"
 )
@@ -11,9 +11,21 @@ val akkaStreamsVersion = "1.0"
 val scalaTestVersion = "2.2.5"
 val mocitoVersion = "1.10.19"
 
+val publish_settings = Seq(
+  publishTo := {
+    if (isSnapshot.value)
+      Some("snapshots" at "http://artifactory.segmetics.com/artifactory/libs-snapshot-local")
+    else
+      Some("artifactory.segmetics.com-releases" at "http://artifactory.segmetics.com/artifactory/libs-release-local")
+  },
+  credentials += Credentials(Path.userHome / ".ivy2" / ".credentials")
+)
+
+
 lazy val client = project. 
-    in(file("etcd-client")). 
-    settings(commonSettings ++ Seq(
+    in(file("etcd-client")).
+    enablePlugins(GitVersioning).
+    settings(commonSettings ++ publish_settings ++ Seq(
         name := "etcd-client",
         libraryDependencies ++= Seq(
             "com.typesafe.akka" %% "akka-actor" % akkaVersion,
@@ -31,8 +43,9 @@ import com.typesafe.sbt.SbtMultiJvm.MultiJvmKeys.MultiJvm
 
 lazy val discovery = project. 
     in(file("etcd-discovery")).
-    dependsOn(client). 
-    settings(commonSettings ++ SbtMultiJvm.multiJvmSettings ++ Seq(
+    dependsOn(client).
+    enablePlugins(GitVersioning).
+    settings(commonSettings ++ SbtMultiJvm.multiJvmSettings ++ publish_settings ++ Seq(
         name := "akka-cluster-discovery-etcd",
         libraryDependencies ++= Seq(
             "com.typesafe.akka" %% "akka-actor" % akkaVersion,
@@ -76,3 +89,5 @@ lazy val clusterMonitor = project.
         )
     ).
     enablePlugins(JavaAppPackaging, DockerPlugin)
+
+

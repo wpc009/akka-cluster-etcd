@@ -21,15 +21,16 @@ import scala.concurrent.duration.Duration
  * @param leaderEntryTTL TTL for leader entry in `etcd`. Leader will attempt to refresh twice during that period.
  */
 case class ClusterDiscoverySettings(
-    etcdHost: String,
-    etcdPort: Int,
-    etcdPath: String,
-    etcdConnectionTimeout: FiniteDuration,
-    etcdRequestTimeout: FiniteDuration,
-    etcdRetryDelay: FiniteDuration,
-    seedsFetchTimeout: FiniteDuration,
-    seedsJoinTimeout: FiniteDuration,
-    leaderEntryTTL: FiniteDuration) {
+                                     etcdHost: String,
+                                     etcdPort: Int,
+                                     etcdPath: String,
+                                     numOfSeeds:Int =2,
+                                     etcdConnectionTimeout: FiniteDuration,
+                                     etcdRequestTimeout: FiniteDuration,
+                                     etcdRetryDelay: FiniteDuration,
+                                     seedsFetchTimeout: FiniteDuration,
+                                     seedsJoinTimeout: FiniteDuration,
+                                     leaderEntryTTL: FiniteDuration) {
 
   import ClusterDiscoverySettings._
 
@@ -67,6 +68,7 @@ object ClusterDiscoverySettings {
     ClusterDiscoverySettings(c.getString("host"),
       c.getInt("port"),
       c.getString("path"),
+      c.getInt("numOfSeeds"),
       duration("etcdConnection"),
       duration("etcdRequest"),
       duration("etcdRetry"),

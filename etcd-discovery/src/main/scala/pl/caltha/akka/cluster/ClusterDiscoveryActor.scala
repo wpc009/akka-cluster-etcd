@@ -1,43 +1,36 @@
 package pl.caltha.akka.cluster
 
+import akka.actor._
+import akka.cluster.Cluster
+import akka.cluster.ClusterEvent.{InitialStateAsSnapshot, MemberEvent, MemberExited, MemberRemoved, MemberUp, _}
+import akka.pattern.pipe
+import pl.caltha.akka.cluster.LeaderEntryActor.{Initialize, Reset}
+import pl.caltha.akka.etcd.{EtcdClient, EtcdError, EtcdException, EtcdNode, EtcdResponse}
+
 import scala.collection.immutable.Set
 import scala.concurrent.Future
-
-import akka.actor.Address
-import akka.actor.AddressFromURIString
-import akka.actor.LoggingFSM
-import akka.actor.Props
-import akka.actor.Status
-import akka.cluster.Cluster
-import akka.cluster.ClusterEvent.InitialStateAsSnapshot
-import akka.cluster.ClusterEvent.MemberEvent
-import akka.cluster.ClusterEvent.MemberExited
-import akka.cluster.ClusterEvent.MemberRemoved
-import akka.cluster.ClusterEvent.MemberUp
-import akka.pattern.pipe
-
-import pl.caltha.akka.etcd.EtcdClient
-import pl.caltha.akka.etcd.EtcdError
-import pl.caltha.akka.etcd.EtcdException
-import pl.caltha.akka.etcd.EtcdNode
-import pl.caltha.akka.etcd.EtcdResponse
-import akka.cluster.ClusterEvent._
+import scala.language.postfixOps
 
 class ClusterDiscoveryActor(
-    etcdClient: EtcdClient,
-    cluster: Cluster,
-    settings: ClusterDiscoverySettings) extends LoggingFSM[ClusterDiscoveryActor.State, ClusterDiscoveryActor.Data] {
+                             etcdClient: EtcdClient,
+                             cluster: Cluster,
+                             settings: ClusterDiscoverySettings) extends LoggingFSM[ClusterDiscoveryActor.State, ClusterDiscoveryActor.Data] {
 
   import ClusterDiscoveryActor._
 
   private implicit val executor = context.system.dispatcher
+
 
   def etcd(operation: EtcdClient ⇒ Future[EtcdResponse]) =
     operation(etcdClient).recover {
       case ex: EtcdException ⇒ ex.error
     }.pipeTo(self)
 
-  val seedList = context.actorOf(SeedListActor.props(etcdClient, settings))
+  val seedList = context.actorOf(SeedListActor.props(etcdClient, settings), "seed-list")
+
+  var isSeedNodes = true
+
+  var _leaderEntry:ActorRef = context.system.deadLetters
 
   when(Initial) {
     case Event(Start, _) ⇒
@@ -74,7 +67,7 @@ class ClusterDiscoveryActor(
       goto(Leader)
     case Event(EtcdError(EtcdError.NodeExist, _, _, _), _) ⇒
       goto(Follower)
-    case Event(err @ EtcdError, _) ⇒
+    case Event(err@EtcdError, _) ⇒
       log.error(s"Election error: $err")
       setTimer("retry", Retry, settings.etcdRetryDelay, false)
       stay()
@@ -93,8 +86,10 @@ class ClusterDiscoveryActor(
       // bootstrap the cluster
       log.info("assuming Leader role")
       cluster.join(cluster.selfAddress)
-      cluster.subscribe(self, initialStateMode = InitialStateAsSnapshot, classOf[MemberEvent])
-      context.actorOf(LeaderEntryActor.props(cluster.selfAddress.toString, etcdClient, settings))
+      cluster.subscribe(self, initialStateMode = InitialStateAsSnapshot, classOf[MemberEvent],classOf[LeaderChanged])
+      if(_leaderEntry == context.system.deadLetters)
+        _leaderEntry = context.actorOf(LeaderEntryActor.props(cluster.selfAddress.toString, etcdClient, settings),"leader-entry")
+      _leaderEntry ! Initialize
   }
 
   when(Leader) {
@@ -102,15 +97,29 @@ class ClusterDiscoveryActor(
       seedList ! SeedListActor.InitialState(members.map(_.address.toString))
       stay().using(members.map(_.address))
     case Event(MemberUp(member), seeds) ⇒
-      seedList ! SeedListActor.MemberAdded(member.address.toString)
-      stay().using(seeds + member.address)
+      log.info("member up {}",member)
+      if(seeds.size < settings.numOfSeeds){
+        seedList ! SeedListActor.MemberAdded(member.address.toString)
+        stay().using(seeds + member.address)
+      }else
+        stay()
     case Event(MemberExited(member), seeds) ⇒
+      log.info("member exist {}",member)
       seedList ! SeedListActor.MemberRemoved(member.address.toString)
       stay().using(seeds - member.address)
     case Event(MemberRemoved(member, _), seeds) ⇒
+      log.info("member removed {}",member)
       if (seeds.contains(member.address))
         seedList ! SeedListActor.MemberRemoved(member.address.toString)
       stay().using(seeds - member.address)
+    case Event(LeaderChanged(optAddress),_) =>
+      optAddress match {
+        case Some(addr) if addr != cluster.selfAddress =>
+          _leaderEntry ! Reset
+          goto(Follower)
+        case _ =>
+          stay()
+      }
   }
 
   def fetchSeeds() =
@@ -120,22 +129,29 @@ class ClusterDiscoveryActor(
       sorted = false))
 
   onTransition {
+    case Leader -> Follower =>
+      log.info("demote to normal seed")
     case (_, Follower) ⇒
       log.info("assuming Follower role")
-      cluster.subscribe(self, initialStateMode = InitialStateAsSnapshot, classOf[MemberEvent])
-      setTimer("seedsFetch", SeedsFetchTimeout, settings.seedsFetchTimeout, false)
+      setTimer("seedsFetch", SeedsFetchTimeout, settings.seedsFetchTimeout, repeat = false)
+      cluster.subscribe(self, initialStateMode = InitialStateAsEvents, classOf[MemberEvent],classOf[UnreachableMember],classOf[LeaderChanged])
       fetchSeeds()
   }
 
   when(Follower) {
     case Event(EtcdResponse("get", EtcdNode(_, _, _, _, _, Some(true), Some(nodes)), _), _) ⇒
+      nodes.foreach(node => {
+        log.info("seed node: {} , index:{}", node.value, node.key)
+      })
       val seeds = nodes.flatMap(_.value).map(AddressFromURIString(_))
       cluster.joinSeedNodes(seeds)
       cancelTimer("seedsFetch")
-      setTimer("seedsJoin", JoinTimeout, settings.seedsJoinTimeout, false)
+      setTimer("seedsJoin", JoinTimeout, settings.seedsJoinTimeout, repeat = false)
+      log.info("set timer seedsJoin")
+      Thread.sleep(1000)
       stay()
     case Event(EtcdError(EtcdError.KeyNotFound, _, _, _), _) ⇒
-      setTimer("retry", Retry, settings.etcdRetryDelay, false)
+      setTimer("retry", Retry, settings.etcdRetryDelay, repeat = false)
       stay()
     case Event(Retry, _) ⇒
       fetchSeeds()
@@ -147,20 +163,36 @@ class ClusterDiscoveryActor(
       log.info(s"seed nodes failed to respond in ${settings.seedsJoinTimeout.toMillis} ms")
       goto(Election)
     case Event(LeaderChanged(Some(address)), _) if address == cluster.selfAddress ⇒
+      log.info("promot to leader")
+      _leaderEntry ! Reset
       goto(Leader)
     case Event(LeaderChanged(optAddress), _) ⇒
       log.info(s"seen leader change to $optAddress")
       stay()
-    case Event(CurrentClusterState(_, _, _, _, _), _) ⇒
-      log.info("joined the cluster")
-      cancelTimer("seedsFetch")
-      cancelTimer("seedsJoin")
+    case Event(x:MemberUp,_) =>
+      if(x.member.address == cluster.selfAddress){
+        cancelTimer("seedsFetch")
+        cancelTimer("seedsJoin")
+
+        log.info("join cluster succeed")
+      }
+      stay()
+    case Event(x@CurrentClusterState(members, unreachable, seenBy, leader, roleLeaderMap), _) ⇒
+      log.info("CurrentClusterState members:{}, leader:{}",members,leader)
+//      log.info("joined the cluster ,{}", x)
+      //      log.info("members:{}, leader:{}",members,leader)
+//      cancelTimer("seedsFetch")
+//      cancelTimer("seedsJoin")
       stay()
     case Event(_: ClusterDomainEvent, _) ⇒
-      stay()      
+      stay()
   }
 
   whenUnhandled {
+    case Event("shutdown", _) =>
+      val f1 = etcdClient.compareAndDelete(settings.leaderPath, Some(cluster.selfAddress.toString))
+      seedList ! SeedListActor.Shutdown(cluster.selfAddress.toString)
+      stop()
     case Event(msg, _) ⇒
       log.warning(s"unhandled message $msg")
       stay()
@@ -179,22 +211,29 @@ object ClusterDiscoveryActor {
    * FSM States
    */
   sealed trait State
+
   case object Initial extends State
+
   case object Election extends State
+
   case object Leader extends State
+
   case object Follower extends State
 
   /**
-   * FSM Data = known cluster nodes
-   */
+    * FSM Data = known cluster nodes
+    */
   type Data = Set[Address]
 
   /**
-   * Message that triggers actor's initialization
-   */
+    * Message that triggers actor's initialization
+    */
   case object Start
+
   case object Retry
+
   private case object SeedsFetchTimeout
+
   private case object JoinTimeout
 
 }

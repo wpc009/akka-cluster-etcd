@@ -1,6 +1,14 @@
 package pl.caltha.akka.cluster
 
-import scala.concurrent.Future
+import java.net.URL
+import java.security.MessageDigest
+
+import akka.http.scaladsl.model.Uri
+import sun.security.provider.MD5
+
+import scala.concurrent.{Await, Future}
+import scala.concurrent.duration._
+import scala.language.postfixOps
 
 import akka.actor.FSM
 import akka.actor.Props
@@ -22,6 +30,10 @@ class SeedListActor(
   import SeedListActor._
 
   private implicit val executionContext = context.dispatcher
+
+  val md5 = MessageDigest.getInstance("MD5")
+
+  def getMD5Hash(src:String) = md5.digest(src.getBytes("UTF-8")).map( "%02X".format(_)).mkString
 
   private def etcd(operation: EtcdClient ⇒ Future[EtcdResponse]) =
     operation(etcdClient).recover {
@@ -86,12 +98,19 @@ class SeedListActor(
 
   when(AwaitingCommand) {
     case Event(command @ MemberAdded(address), AwaitingCommandData(addressMapping)) ⇒
-      etcd(_.create(settings.seedsPath, address))
-      goto(AwaitingEtcdReply).using(AwaitingEtcdReplyData(command, addressMapping))
+      if(!addressMapping.contains(address)){
+        log.info("add {} into seed list",address)
+        etcd(_.create(settings.seedsPath, address))
+        goto(AwaitingEtcdReply).using(AwaitingEtcdReplyData(command, addressMapping))
+      }else{
+        log.warning(s"$address already in seeds, key:${addressMapping(address)}")
+        stay()
+      }
+
     case Event(command @ MemberRemoved(address), AwaitingCommandData(addressMapping)) ⇒
       addressMapping.get(address) match {
         case Some(key) ⇒
-          etcd(_.delete(key, false))
+          etcd(_.delete(key, recursive = false))
           goto(AwaitingEtcdReply).using(AwaitingEtcdReplyData(command, addressMapping))
         case None ⇒
           stay()
@@ -108,8 +127,12 @@ class SeedListActor(
       unstashAll()
       goto(AwaitingCommand).using(AwaitingCommandData(addressMapping - address))
     case Event(e: EtcdError, AwaitingEtcdReplyData(command, addressMapping)) ⇒
-      log.warning(s"etcd error while handing ${command}: $e")
-      retryMsg(command)
+      log.warning(s"etcd error while handing $command: $e")
+      command match {
+        case m:MemberRemoved =>
+        case m:MemberAdded =>
+          retryMsg(command)
+      }
       unstashAll()
       goto(AwaitingCommand).using(AwaitingCommandData(addressMapping))
     case Event(Status.Failure(t), AwaitingEtcdReplyData(command, addressMapping)) ⇒
@@ -120,6 +143,18 @@ class SeedListActor(
     case Event(MemberAdded(_) | MemberRemoved(_), _) ⇒
       stash()
       stay()
+  }
+
+  whenUnhandled{
+    case Event(InitialState(members), _) ⇒
+      etcd(_.get(settings.seedsPath, true, false))
+      goto(AwaitingRegisterdSeeds).using(AwaitingRegisterdSeedsData(members))
+    case Event(Shutdown(member),data:AwaitingCommandData) =>
+      if(data.addressMapping.contains(member)){
+        log.info(s"${member} shutting down, removing from seed list")
+        Await.result(etcdClient.delete(data.addressMapping(member)),5 seconds)
+      }
+      stop()
   }
 
   startWith(AwaitingInitialState, AwaitingInitialStateData)
@@ -147,4 +182,6 @@ object SeedListActor {
   sealed trait Command
   case class MemberAdded(member: String) extends Command
   case class MemberRemoved(member: String) extends Command
+
+  case class Shutdown(member:String) extends Command
 }
