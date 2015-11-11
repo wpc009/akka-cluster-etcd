@@ -89,6 +89,9 @@ class ClusterDiscoveryActor(
       cluster.subscribe(self, initialStateMode = InitialStateAsSnapshot, classOf[MemberEvent],classOf[LeaderChanged])
       if(_leaderEntry == context.system.deadLetters)
         _leaderEntry = context.actorOf(LeaderEntryActor.props(cluster.selfAddress.toString, etcdClient, settings),"leader-entry")
+      else
+        _leaderEntry ! Reset
+
       _leaderEntry ! Initialize
   }
 
@@ -164,7 +167,6 @@ class ClusterDiscoveryActor(
       goto(Election)
     case Event(LeaderChanged(Some(address)), _) if address == cluster.selfAddress ⇒
       log.info("promot to leader")
-      _leaderEntry ! Reset
       goto(Leader)
     case Event(LeaderChanged(optAddress), _) ⇒
       log.info(s"seen leader change to $optAddress")
